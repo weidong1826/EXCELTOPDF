@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Excel 转 PDF </title>
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    
+    <style>
+        /* --- UI 界面样式 --- */
+        :root { --bg-color: #525659; --sidebar-width: 320px; --primary-color: #107c41; /* Excel Green */ }
+        body { font-family: 'Segoe UI', Roboto, sans-serif; margin: 0; display: flex; height: 100vh; background-color: var(--bg-color); overflow: hidden; }
+        
+        .sidebar { width: var(--sidebar-width); background: #f8f9fa; padding: 20px; display: flex; flex-direction: column; gap: 15px; box-shadow: 2px 0 10px rgba(0,0,0,0.2); z-index: 100; overflow-y: auto; border-right: 1px solid #ddd; }
+        .control-group { display: flex; flex-direction: column; gap: 6px; }
+        label { font-size: 13px; font-weight: 600; color: #333; }
+        select, input, button { padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+        
+        button.btn-primary { background-color: var(--primary-color); color: white; border: none; font-size: 15px; font-weight: bold; cursor: pointer; margin-top: 10px; transition: 0.2s; }
+        button.btn-primary:hover { background-color: #0c5e31; }
+        
+        .slider-container { display: flex; align-items: center; gap: 10px; }
+        .slider-value { min-width: 40px; text-align: right; font-weight: bold; color: var(--primary-color); }
+
+        /* --- 预览区域 --- */
+        .preview-area { flex: 1; padding: 40px; overflow: auto; display: flex; justify-content: center; align-items: flex-start; }
+        
+        /* 模拟纸张容器 */
+        #print-container {
+            background: white;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+            min-height: 297mm;
+            /* 宽度由 JS 动态设置 */
+            box-sizing: border-box;
+            /* 关键：去掉 padding，让 Excel 内容顶格或由 CSS margin 控制 */
+            padding: 0; 
+            transform-origin: top center;
+        }
+
+        /* --- 表格内容样式 (核心优化) --- */
+        table { 
+            border-collapse: collapse; 
+            width: 100%; 
+            table-layout: fixed; /* 修复预览乱跑的问题，强制列宽 */
+        }
+        
+        th, td { 
+            border: 1px solid #000; 
+            /* 允许换行 */
+            word-wrap: break-word; 
+            overflow-wrap: break-word;
+            vertical-align: middle;
+        }
+        
+        /* 紧凑模式样式 (默认) */
+        .compact-mode th, .compact-mode td {
+            padding: 2px 4px; /* 极小的内边距 */
+            font-size: 11px;  /* Excel 默认字体大小范围 */
+            line-height: 1.2;
+        }
+
+        /* 宽松模式 (可选) */
+        .loose-mode th, .loose-mode td {
+            padding: 8px;
+            font-size: 14px;
+        }
+
+        th { background-color: #f3f3f3; font-weight: bold; text-align: center; }
+
+        /* 关键：修复行切割，但不再强制表头重复 */
+        tr { page-break-inside: avoid; break-inside: avoid; }
+        
+        /* 默认不重复表头，如果需要重复，可以加 thead { display: table-header-group }，这里去掉 */
+        thead { display: table-row-group; } 
+
+        /* --- 打印时的样式覆盖 --- */
+        @media print {
+            .sidebar { display: none !important; }
+            .preview-area { 
+                padding: 0 !important; 
+                background: white !important; 
+                display: block !important; 
+                overflow: visible !important;
+            }
+            #print-container {
+                box-shadow: none !important;
+                margin: 0 !important;
+                width: 100% !important;
+                /* 打印时高度自适应 */
+                min-height: 0 !important; 
+            }
+            body { background: white; height: auto; overflow: visible; }
+        }
+    </style>
+    <style id="dynamic-style"></style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <h3>Excel 转 PDF</h3>
+        
+        <div class="control-group">
+            <label>1. 文件与工作表</label>
+            <input type="file" id="fileInput" accept=".xlsx, .xls">
+            <select id="sheetSelect" disabled style="background:#f0f0f0"></select>
+        </div>
+
+        <hr style="border:0; border-top:1px solid #ddd; width:100%">
+
+        <div class="control-group">
+            <label>2. 纸张与布局</label>
+            <select id="pageSize">
+                <option value="A4">A4 (210 x 297 mm)</option>
+                <option value="A3">A3 (297 x 420 mm)</option>
+            </select>
+            <select id="orientation">
+                <option value="portrait">纵向</option>
+                <option value="landscape">横向</option>
+            </select>
+        </div>
+
+        <div class="control-group">
+            <label>3. 缩放比例 (控制页数关键)</label>
+            <div class="slider-container">
+                <input type="range" id="scaleRange" min="30" max="150" value="85" step="5" style="flex:1">
+                <span class="slider-value" id="scaleValue">85%</span>
+            </div>
+            <div style="font-size:11px; color:#666;">越小则页数越少，类似于 Excel 的“缩放”。</div>
+        </div>
+
+        <div class="control-group">
+            <label>4. 密度设置</label>
+            <select id="densityMode">
+                <option value="compact">紧凑 (Excel 默认风格)</option>
+                <option value="loose">宽松 (网页风格)</option>
+            </select>
+        </div>
+        
+        <div class="control-group">
+            <label>范围 (可选)</label>
+            <input type="text" id="rangeInput" placeholder="如 A1:F50">
+        </div>
+
+        <button class="btn-primary" onclick="window.print()">🖨️ 打印 / 另存为 PDF</button>
+        <div style="font-size:12px; color:#555; margin-top:5px;">
+            <b>提示：</b> 在打印窗口中：<br>
+            1. 目标选择 <b>另存为 PDF</b><br>
+            2. <b>页边距</b> 建议设为 "无" 或 "最小值"<br>
+            3. 勾选 <b>背景图形</b><br>
+            4. 小红书搜索：呼和浩特著名用户 免费制作更多工具
+        </div>
+    </div>
+
+    <div class="preview-area">
+        <div id="print-container" class="compact-mode">
+            <div style="text-align:center; padding-top:100px; color:#aaa;">
+                请上传文件预览
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let workbook = null;
+        
+        const UI = {
+            file: document.getElementById('fileInput'),
+            sheet: document.getElementById('sheetSelect'),
+            container: document.getElementById('print-container'),
+            pageSize: document.getElementById('pageSize'),
+            orientation: document.getElementById('orientation'),
+            scale: document.getElementById('scaleRange'),
+            scaleVal: document.getElementById('scaleValue'),
+            density: document.getElementById('densityMode'),
+            range: document.getElementById('rangeInput'),
+            styleTag: document.getElementById('dynamic-style')
+        };
+
+        // 事件监听
+        UI.file.addEventListener('change', loadFile);
+        UI.scale.addEventListener('input', (e) => {
+            UI.scaleVal.innerText = e.target.value + '%';
+            updateStyles(); // 缩放只需更新 CSS
+        });
+        
+        [UI.sheet, UI.range].forEach(el => el.addEventListener('change', renderTable));
+        [UI.pageSize, UI.orientation, UI.density].forEach(el => el.addEventListener('change', updateStyles));
+
+        function loadFile(e) {
+            const file = e.target.files[0];
+            if(!file) return;
+            const reader = new FileReader();
+            reader.onload = e => {
+                const data = new Uint8Array(e.target.result);
+                workbook = XLSX.read(data, {type: 'array'});
+                UI.sheet.innerHTML = '';
+                workbook.SheetNames.forEach(n => {
+                    const opt = document.createElement('option');
+                    opt.value = opt.textContent = n;
+                    UI.sheet.appendChild(opt);
+                });
+                UI.sheet.disabled = false;
+                renderTable();
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        function renderTable() {
+            if(!workbook) return;
+            const ws = workbook.Sheets[UI.sheet.value];
+            
+            // 范围处理
+            const originalRef = ws['!ref'];
+            const userRange = UI.range.value.trim();
+            if(userRange) {
+                try { XLSX.utils.decode_range(userRange); ws['!ref'] = userRange; } catch(e){}
+            }
+            
+            // 生成 HTML
+            const html = XLSX.utils.sheet_to_html(ws);
+            ws['!ref'] = originalRef;
+            
+            UI.container.innerHTML = html;
+            
+            // 简单清理：去除 SheetJS 生成的内联宽高，让 CSS 接管
+            const table = UI.container.querySelector('table');
+            if(table) {
+                table.removeAttribute('width');
+                table.removeAttribute('height');
+                table.style.width = '100%';
+            }
+
+            updateStyles();
+        }
+
+        function updateStyles() {
+            if(!workbook) return;
+
+            // 1. 获取设置值
+            const size = UI.pageSize.value; // A4, A3
+            const orient = UI.orientation.value; // portrait
+            const scale = parseInt(UI.scale.value) / 100;
+            const density = UI.density.value;
+
+            // 2. 切换密度 Class
+            UI.container.className = density === 'compact' ? 'compact-mode' : 'loose-mode';
+
+            // 3. 计算物理宽度 (用于预览区容器大小)
+            const sizesMM = { 'A4': [210, 297], 'A3': [297, 420] };
+            let [w, h] = sizesMM[size];
+            if(orient === 'landscape') [w, h] = [h, w];
+            
+            // 这里的宽度是“未缩放前”的物理纸张宽度
+            // 我们通过 zoom 属性来控制内容大小，但容器本身需要模拟纸张
+            // 为了让预览和打印一致，我们在 print-container 上应用 zoom
+            
+            UI.container.style.width = w + 'mm';
+            // Chrome 的 zoom 属性非常强大，会真实地缩放布局
+            UI.container.style.zoom = scale; 
+
+            // 4. 生成 @page 规则 (控制打印机行为)
+            // 必须在 @page 中明确告诉打印机纸张大小
+            // margin 设为 0 或很小，让 HTML 内容最大化利用纸张
+            UI.styleTag.innerHTML = `
+                @page {
+                    size: ${size} ${orient};
+                    margin: 5mm; 
+                }
+            `;
+        }
+    </script>
+</body>
+</html>
